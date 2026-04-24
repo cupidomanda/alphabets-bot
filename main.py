@@ -2,26 +2,32 @@ import os
 import threading
 import stripe
 import requests
+import json
 from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, ChatJoinRequestHandler
 
 # === 1. CONFIGURACIÓN ===
-TOKEN = os.environ.get("TOKEN", "TU_TOKEN_POR_SI_ACASO")
+TOKEN = os.environ.get("TOKEN", "TU_TOKEN")
 stripe.api_key = os.environ.get("STRIPE_API_KEY")
 WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
 
-# Tu ID de administrador ya puesto
-ADMIN_ID = 8000243455 
-
-# Archivo donde guardaremos a los clientes VIP
-VIP_FILE = "usuarios_vip.txt"
+# Disco duro blindado de Railway para la Base de Datos
+DB_FILE = "/data/database.json"
 
 LINKS_STRIPE = {
     "bronce": "https://buy.stripe.com/dRm7sM1aY3Un1ND2Cabo400",
     "plata": "https://buy.stripe.com/00w28s9HugH90Jzgt0bo403",
     "oro": "https://buy.stripe.com/4gM5kEg5ScqTdwlekSbo402",
     "diamante": "https://buy.stripe.com/8x29AU1aYcqT9g52Cabo404"
+}
+
+# 👇 AQUÍ ES DONDE TIENES QUE RELLENAR TUS DATOS
+CANALES_CONFIG = {
+    "bronce": {"id": -1003556020198, "link": "https://t.me/+CebE1h3T3zczNDIx"},
+    "plata": {"id": -1003932471723, "link": "https://t.me/+_6jSN2Gfeog2NjRh"},
+    "oro": {"id": -1003953909208, "link": "https://t.me/+0EP2r82YeN82NjEx"},
+    "diamante": {"id": -1003943835185, "link": "https://t.me/+1Z5xJp134gEyNTIx"}
 }
 
 TEXTO_BIENVENIDA = (
@@ -36,28 +42,25 @@ TEXTO_BIENVENIDA = (
     "👇 *Selecciona una opción abajo para empezar:*"
 )
 
-# === 2. GESTIÓN DE USUARIOS VIP ===
-def agregar_vip(user_id):
-    user_id = str(user_id)
-    if not os.path.exists(VIP_FILE):
-        open(VIP_FILE, "w").close()
+# === 2. BASE DE DATOS SEGURA ===
+def guardar_usuario(stripe_cust_id, telegram_id, plan):
+    data = {}
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE, "r") as f: data = json.load(f)
+        except: pass
     
-    with open(VIP_FILE, "r") as f:
-        vips = f.read().splitlines()
-    
-    if user_id not in vips:
-        with open(VIP_FILE, "a") as f:
-            f.write(user_id + "\n")
-        return True
-    return False
+    data[stripe_cust_id] = {"telegram_id": str(telegram_id), "plan": plan}
+    with open(DB_FILE, "w") as f: json.dump(data, f)
 
-def obtener_vips():
-    if not os.path.exists(VIP_FILE):
-        return []
-    with open(VIP_FILE, "r") as f:
-        return f.read().splitlines()
+def obtener_usuario(stripe_cust_id):
+    if not os.path.exists(DB_FILE): return None
+    try:
+        with open(DB_FILE, "r") as f: data = json.load(f)
+        return data.get(stripe_cust_id)
+    except: return None
 
-# === 3. LÓGICA DEL BOT ===
+# === 3. LÓGICA DEL BOT DE TELEGRAM ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     teclado = [
@@ -71,49 +74,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         await update.message.reply_text(TEXTO_BIENVENIDA, reply_markup=reply_markup, parse_mode="Markdown")
 
-async def enviar_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Solo el admin puede usar esto: /enviar_pick MENSAJE
-    if update.effective_user.id != ADMIN_ID:
-        return
-
-    mensaje = " ".join(context.args)
-    if not mensaje:
-        await update.message.reply_text("❌ Escribe algo: `/enviar_pick Gana Madrid...`", parse_mode="Markdown")
-        return
-
-    vips = obtener_vips()
-    enviados = 0
-    for uid in vips:
-        try:
-            await context.bot.send_message(chat_id=uid, text=f"🚀 *NUEVO PRONÓSTICO VIP*\n\n{mensaje}", parse_mode="Markdown")
-            enviados += 1
-        except: pass
-    
-    await update.message.reply_text(f"✅ Pick enviado a {enviados} usuarios VIP.")
-
-async def ver_vips(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Solo tú (el admin) puedes ver la lista
-    if update.effective_user.id != ADMIN_ID:
-        return
-
-    vips = obtener_vips()
-    if not vips:
-        await update.message.reply_text("📭 Aún no tienes ningún usuario VIP.")
-        return
-
-    texto = f"👥 *Tienes {len(vips)} clientes VIP activos:*\n\n"
-    for uid in vips:
-        texto += f"• ID: `{uid}`\n"
-    
-    await update.message.reply_text(texto, parse_mode="Markdown")
-
 async def manejar_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
 
     if data == "menu_planes":
-        texto_planes = "🔥 *OFERTA POR TIEMPO LIMITADO*\n\n🥉 *BRONCE:* ~29,99€~ 👉 *19,99€*\n🥈 *PLATA:* ~59,99€~ 👉 *39,99€*\n🥇 *ORO:* ~89,99€~ 👉 *59,99€*\n💎 *DIAMANTE:* ~149,99€~ 👉 *99,99€*\n\n👇 *Toca un plan para activar (Recibirás los picks por privado):*"
+        texto_planes = "🔥 *OFERTA POR TIEMPO LIMITADO*\n\n🥉 *BRONCE:* ~29,99€~ 👉 *19,99€*\n🥈 *PLATA:* ~59,99€~ 👉 *39,99€*\n🥇 *ORO:* ~89,99€~ 👉 *59,99€*\n💎 *DIAMANTE:* ~149,99€~ 👉 *99,99€*\n\n👇 *Toca un plan para activar (Recibirás acceso automático a tu canal):*"
         botones = [
             [InlineKeyboardButton("🥉 Bronce", callback_data="plan_bronce"), InlineKeyboardButton("🥈 Plata", callback_data="plan_plata")],
             [InlineKeyboardButton("🥇 Oro", callback_data="plan_oro"), InlineKeyboardButton("💎 Diamante", callback_data="plan_diamante")],
@@ -126,8 +93,8 @@ async def manejar_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("plan_"):
         plan = data.split("_")[1]
-        link = f"{LINKS_STRIPE[plan]}?client_reference_id={query.from_user.id}"
-        texto = f"💳 *Suscripción {plan.upper()}*\n\nPulsa abajo para completar el pago seguro.\n\n🚀 *Acceso inmediato tras el pago.*"
+        link = f"{LINKS_STRIPE[plan]}?client_reference_id={query.from_user.id}_{plan}"
+        texto = f"💳 *Suscripción {plan.upper()}*\n\nPulsa abajo para completar el pago seguro.\n\n🚀 *El bot te enviará el enlace a tu Canal VIP tras el pago.*"
         botones = [[InlineKeyboardButton("🔥 PAGAR CON DESCUENTO", url=link)], [InlineKeyboardButton("🔙 Volver a Planes", callback_data="menu_planes")]]
         await query.edit_message_caption(caption=texto, reply_markup=InlineKeyboardMarkup(botones), parse_mode="Markdown")
 
@@ -145,12 +112,44 @@ async def manejar_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_media(media=InputMediaPhoto(media=f, caption=TEXTO_BIENVENIDA, parse_mode="Markdown"), reply_markup=InlineKeyboardMarkup(botones))
         except: pass
 
-# === 4. SERVIDOR WEB PARA RECIBIR PAGOS DE STRIPE ===
+# === 4. EL "SEGURATA" DE LA PUERTA (Aprobar o Rechazar peticiones) ===
+async def manejador_solicitudes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    request_join = update.chat_join_request
+    user_id = str(request_join.from_user.id)
+    chat_id = str(request_join.chat.id)
+    
+    tiene_acceso = False
+    
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE, "r") as f:
+                data = json.load(f)
+                for cust_id, info in data.items():
+                    if info.get("telegram_id") == user_id:
+                        plan_usuario = info.get("plan")
+                        chat_id_plan = str(CANALES_CONFIG.get(plan_usuario, {}).get("id"))
+                        if chat_id_plan == chat_id:
+                            tiene_acceso = True
+                            break
+        except Exception: pass
+
+    if tiene_acceso:
+        await request_join.approve()
+        try:
+            await context.bot.send_message(chat_id=user_id, text="✅ *Acceso Concedido.*\n\nHe verificado tu suscripción. ¡Bienvenido al Canal VIP!", parse_mode="Markdown")
+        except: pass
+    else:
+        await request_join.decline()
+        try:
+            await context.bot.send_message(chat_id=user_id, text="❌ *Acceso Denegado.*\n\nTu solicitud de unión ha sido rechazada porque no consta un pago activo para este canal.", parse_mode="Markdown")
+        except: pass
+
+# === 5. WEBHOOK (PAGOS Y EXPULSIONES) ===
 app_flask = Flask(__name__)
 
 @app_flask.route('/')
 def home():
-    return "Bot funcionando correctamente en Railway"
+    return "Bot de Alphabets funcionando correctamente"
 
 @app_flask.route('/webhook', methods=['POST'])
 def webhook():
@@ -159,19 +158,38 @@ def webhook():
 
     try:
         event = stripe.Webhook.construct_event(payload, sig_header, WEBHOOK_SECRET)
-    except Exception as e:
+    except Exception:
         return jsonify(success=False), 400
 
     if event['type'] == 'checkout.session.completed':
         session = event['data']['object']
+        datos_cliente = session.get('client_reference_id') 
+        cust_id = session.get('customer')
         
-        user_id = session.get('client_reference_id') 
+        if datos_cliente and "_" in datos_cliente and cust_id:
+            try:
+                user_id, plan_comprado = datos_cliente.split('_')
+                guardar_usuario(cust_id, user_id, plan_comprado)
+                
+                link_canal = CANALES_CONFIG.get(plan_comprado, {}).get("link", "Enlace no configurado.")
+                texto_exito = f"✅ *¡PAGO CONFIRMADO!*\n\nHas adquirido el plan *{plan_comprado.upper()}*.\n\nÚnete a tu canal VIP exclusivo pulsando el siguiente enlace y el sistema te aprobará automáticamente:\n👉 {link_canal}\n\n¡Mucha suerte!"
+                requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", json={"chat_id": user_id, "text": texto_exito, "parse_mode": "Markdown"})
+            except Exception as e: print(e)
+
+    elif event['type'] == 'customer.subscription.deleted':
+        subscription = event['data']['object']
+        cust_id = subscription.get('customer')
+        user_data = obtener_usuario(cust_id)
         
-        if user_id:
-            agregar_vip(user_id)
-            texto_exito = "✅ *¡PAGO CONFIRMADO!*\n\nYa estás en la lista VIP. A partir de ahora recibirás todos nuestros pronósticos por este chat privado. ¡Mucha suerte!"
-            url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-            requests.post(url, json={"chat_id": user_id, "text": texto_exito, "parse_mode": "Markdown"})
+        if user_data:
+            t_id = user_data['telegram_id']
+            plan = user_data['plan']
+            chat_id = CANALES_CONFIG.get(plan, {}).get("id")
+            
+            if chat_id:
+                requests.post(f"https://api.telegram.org/bot{TOKEN}/banChatMember", json={"chat_id": chat_id, "user_id": t_id})
+                requests.post(f"https://api.telegram.org/bot{TOKEN}/unbanChatMember", json={"chat_id": chat_id, "user_id": t_id, "only_if_banned": True})
+                requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", json={"chat_id": t_id, "text": "❌ *Suscripción Finalizada*\n\nTu suscripción ha terminado y el acceso al Canal VIP ha sido revocado.", "parse_mode": "Markdown"})
 
     return jsonify(success=True)
 
@@ -179,14 +197,12 @@ def run_flask():
     puerto = int(os.environ.get("PORT", 8080))
     app_flask.run(host='0.0.0.0', port=puerto)
 
-# === 5. ARRANQUE DEL BOT ===
+# === 6. ARRANQUE DEL BOT ===
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
-    
-    print("🚀 Iniciando bot...")
+    print("🚀 Iniciando bot Aduana...")
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("enviar_pick", enviar_pick))
-    app.add_handler(CommandHandler("ver_vips", ver_vips)) # <-- ¡AQUÍ ESTÁ EL COMANDO QUE FALTABA!
     app.add_handler(CallbackQueryHandler(manejar_botones))
+    app.add_handler(ChatJoinRequestHandler(manejador_solicitudes))
     app.run_polling()
