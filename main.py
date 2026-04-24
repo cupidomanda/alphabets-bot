@@ -12,14 +12,16 @@ TOKEN = os.environ.get("TOKEN", "TU_TOKEN")
 stripe.api_key = os.environ.get("STRIPE_API_KEY")
 WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
 
-# 👇 ¡VITAL! PON AQUÍ TU ID DE TELEGRAM (Solo números, entre las comillas)
-TU_TELEGRAM_ID = "8000243455" 
+# Tu ID de Jefe (Para los comandos de Admin y recibir datos de retiro)
+TU_TELEGRAM_ID = "8000243455"
 
+# Bases de datos
 DB_FILE = "/data/database.json"
 DB_AFILIADOS = "/data/afiliados.json"
+DB_USUARIOS_TOTALES = "/data/users.json"
 
-# 👇 PON AQUÍ EL NOMBRE DE USUARIO DE TU BOT (Sin la @)
-BOT_USERNAME = "alphabetsia_bot" 
+# Usuario de tu bot
+BOT_USERNAME = "alphabetsia_bot"
 
 # Comisiones (30% exacto de los precios base)
 COMISIONES = {
@@ -29,7 +31,7 @@ COMISIONES = {
     "diamante": 27.00 
 }
 
-# 👇 ENLACES DE PAGO REALES DE STRIPE
+# 👇 REVISA QUE ESTOS SEAN TUS LINKS DE PAGO REALES DE STRIPE
 LINKS_STRIPE = {
     "bronce": "https://buy.stripe.com/dRm7sM1aY3Un1ND2Cabo400",
     "plata": "https://buy.stripe.com/00w28s9HugH90Jzgt0bo403",
@@ -37,7 +39,7 @@ LINKS_STRIPE = {
     "diamante": "https://buy.stripe.com/8x29AU1aYcqT9g52Cabo404"
 }
 
-# 👇 IDS Y LINKS DE LOS CANALES (Deben tener la Aprobación activada)
+# Tus Canales Oficiales Integrados
 CANALES_CONFIG = {
     "bronce": {"id": -1003556020198, "link": "https://t.me/+CebE1h3T3zczNDIx"},
     "plata": {"id": -1003932471723, "link": "https://t.me/+_6jSN2Gfeog2NjRh"},
@@ -48,7 +50,6 @@ CANALES_CONFIG = {
 # Semáforos de seguridad anti-colapsos
 db_lock = threading.Lock()
 afi_lock = threading.Lock()
-
 esperando_datos = {}
 
 TEXTO_BIENVENIDA = (
@@ -71,9 +72,16 @@ def cargar_json(archivo, defecto):
     except: return defecto
 
 def guardar_json(archivo, data):
-    try:
-        with open(archivo, "w") as f: json.dump(data, f)
-    except Exception as e: print(f"Error guardando {archivo}: {e}")
+    with db_lock:
+        try:
+            with open(archivo, "w") as f: json.dump(data, f)
+        except Exception as e: print(f"Error guardando {archivo}: {e}")
+
+def registrar_usuario_total(user_id):
+    users = cargar_json(DB_USUARIOS_TOTALES, [])
+    if str(user_id) not in users:
+        users.append(str(user_id))
+        guardar_json(DB_USUARIOS_TOTALES, users)
 
 def registrar_clic_referido(nuevo_id, referidor_id):
     if str(nuevo_id) == str(referidor_id): return
@@ -81,7 +89,7 @@ def registrar_clic_referido(nuevo_id, referidor_id):
         data = cargar_json(DB_AFILIADOS, {"referidos_pendientes": {}, "usuarios": {}})
         if str(nuevo_id) not in data["referidos_pendientes"]:
             data["referidos_pendientes"][str(nuevo_id)] = str(referidor_id)
-            guardar_json(DB_AFILIADOS, data)
+            with open(DB_AFILIADOS, "w") as f: json.dump(data, f)
 
 def procesar_venta_afiliado(comprador_id, plan):
     with afi_lock:
@@ -95,11 +103,69 @@ def procesar_venta_afiliado(comprador_id, plan):
             comision = COMISIONES.get(plan, 0)
             data["usuarios"][referidor_id]["ventas"] += 1
             data["usuarios"][referidor_id]["saldo"] += comision
-            guardar_json(DB_AFILIADOS, data)
+            with open(DB_AFILIADOS, "w") as f: json.dump(data, f)
             return referidor_id, comision
         return None, 0
 
-# === 3. LÓGICA DEL BOT DE TELEGRAM ===
+# === 3. COMANDOS DE ADMINISTRADOR (MODO DIOS) ===
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != TU_TELEGRAM_ID: return
+    
+    vips = cargar_json(DB_FILE, {})
+    afiliados = cargar_json(DB_AFILIADOS, {"usuarios": {}})
+    total_vips = len(vips)
+    
+    saldo_pendiente = sum(u.get('saldo', 0) for u in afiliados['usuarios'].values())
+    ventas_totales = sum(u.get('ventas', 0) for u in afiliados['usuarios'].values())
+
+    resumen = (
+        "📊 *MODO DIOS - ALPHABETS*\n\n"
+        f"👥 Clientes VIP activos: *{total_vips}*\n"
+        f"🤝 Ventas de afiliados totales: *{ventas_totales}*\n"
+        f"💰 Deuda total a afiliados: *{saldo_pendiente:.2f}€*\n\n"
+        "🛠 *Tus Herramientas:*\n"
+        "• `/db` - Descargar bases de datos\n"
+        "• `/mensaje [texto]` - Envía un mensaje masivo a todos\n"
+        "• `/pagado [ID]` - Notifica un pago a un afiliado"
+    )
+    await update.message.reply_text(resumen, parse_mode="Markdown")
+
+async def enviar_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != TU_TELEGRAM_ID: return
+    for file in [DB_FILE, DB_AFILIADOS, DB_USUARIOS_TOTALES]:
+        if os.path.exists(file):
+            try: await context.bot.send_document(chat_id=TU_TELEGRAM_ID, document=open(file, 'rb'))
+            except Exception as e: print(f"Error enviando {file}: {e}")
+
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != TU_TELEGRAM_ID: return
+    mensaje = " ".join(context.args)
+    if not mensaje:
+        await update.message.reply_text("Uso: `/mensaje Hola a todos los usuarios`")
+        return
+    
+    users = cargar_json(DB_USUARIOS_TOTALES, [])
+    exito = 0
+    for u_id in users:
+        try:
+            await context.bot.send_message(chat_id=u_id, text=f"📢 *NOTIFICACIÓN ALPHABETS*\n\n{mensaje}", parse_mode="Markdown")
+            exito += 1
+        except: pass
+    await update.message.reply_text(f"✅ Mensaje masivo enviado correctamente a {exito} usuarios.")
+
+async def confirmar_pago(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != TU_TELEGRAM_ID: return
+    if not context.args:
+        await update.message.reply_text("Uso: `/pagado [ID_DEL_AFILIADO]`")
+        return
+    target_id = context.args[0]
+    try:
+        await context.bot.send_message(chat_id=target_id, text="✅ *¡PAGO ENVIADO!*\n\nEl administrador ha procesado tu retiro de afiliado y el dinero está en camino. ¡Gracias por formar parte del equipo Alphabets!", parse_mode="Markdown")
+        await update.message.reply_text(f"✅ Notificación de pago enviada al usuario {target_id}.")
+    except:
+        await update.message.reply_text("❌ No se pudo enviar el mensaje. ¿Es correcta la ID?")
+
+# === 4. LÓGICA DEL BOT PARA CLIENTES ===
 async def enviar_menu_principal(chat_id, context, borrar_mensaje=None):
     botones = [[InlineKeyboardButton("💎 Ver Planes de Suscripción", callback_data="menu_planes")],
                [InlineKeyboardButton("🤝 Sistema de Afiliados", callback_data="menu_afiliados")]]
@@ -112,9 +178,13 @@ async def enviar_menu_principal(chat_id, context, borrar_mensaje=None):
         await context.bot.send_message(chat_id=chat_id, text=TEXTO_BIENVENIDA, reply_markup=InlineKeyboardMarkup(botones), parse_mode="Markdown")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    user_id = str(update.effective_user.id)
+    registrar_usuario_total(user_id)
+    
     if context.args and context.args[0].startswith("ref_"):
-        registrar_clic_referido(user_id, context.args[0].split("_")[1])
+        referidor_id = context.args[0].split("_")[1]
+        registrar_clic_referido(user_id, referidor_id)
+        
     await enviar_menu_principal(user_id, context)
 
 async def manejar_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -199,7 +269,7 @@ async def manejar_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "menu_inicio":
         await enviar_menu_principal(user_id, context, borrar_mensaje=query.message)
 
-# === 4. RECEPTOR DE DATOS DE RETIRO (Solo chat privado) ===
+# === 5. RECEPTOR DE DATOS DE RETIRO (Solo chat privado) ===
 async def manejar_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     
@@ -226,7 +296,8 @@ async def manejar_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 # Descontamos el saldo
                 datos_afi["usuarios"][user_id]["saldo"] = 0.0
-                guardar_json(DB_AFILIADOS, datos_afi)
+                with open(DB_AFILIADOS, "w") as f: json.dump(datos_afi, f)
+                
                 del esperando_datos[user_id]
                 
                 await update.message.reply_text("✅ *Datos recibidos con éxito.*\n\nTu solicitud ha sido enviada a nuestro equipo de pagos. Recibirás tu dinero en breve.", parse_mode="Markdown")
@@ -235,7 +306,7 @@ async def manejar_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 del esperando_datos[user_id]
                 await update.message.reply_text("❌ Ha ocurrido un error o tu saldo es insuficiente.")
 
-# === 5. EL "SEGURATA" DE LA ADUANA ===
+# === 6. EL "SEGURATA" DE LA ADUANA ===
 async def manejador_solicitudes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     request_join = update.chat_join_request
     user_id = str(request_join.from_user.id)
@@ -253,12 +324,14 @@ async def manejador_solicitudes(update: Update, context: ContextTypes.DEFAULT_TY
 
     if tiene_acceso:
         await request_join.approve()
-        try: await context.bot.send_message(chat_id=user_id, text="✅ *Acceso Concedido.*", parse_mode="Markdown")
+        try: await context.bot.send_message(chat_id=user_id, text="✅ *Acceso Concedido.*\n\nHe verificado tu suscripción. ¡Bienvenido al Canal VIP!", parse_mode="Markdown")
         except: pass
     else:
         await request_join.decline()
+        try: await context.bot.send_message(chat_id=user_id, text="❌ *Acceso Denegado.*\n\nTu solicitud de unión ha sido rechazada porque no consta un pago activo para este canal, o tu suscripción ha expirado.", parse_mode="Markdown")
+        except: pass
 
-# === 6. WEBHOOK DE STRIPE ===
+# === 7. WEBHOOK DE STRIPE ===
 app_flask = Flask(__name__)
 
 @app_flask.route('/webhook', methods=['POST'])
@@ -283,7 +356,7 @@ def webhook():
             with db_lock:
                 data_vip = cargar_json(DB_FILE, {})
                 data_vip[cust_id] = {"telegram_id": user_id, "plan": plan}
-                guardar_json(DB_FILE, data_vip)
+                with open(DB_FILE, "w") as f: json.dump(data_vip, f)
 
             # Gestión de Afiliado
             referidor_id, comision = procesar_venta_afiliado(user_id, plan)
@@ -294,7 +367,7 @@ def webhook():
 
             # Mandar link al comprador
             link = CANALES_CONFIG.get(plan, {}).get('link', 'Enlace no configurado')
-            try: requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", json={"chat_id": user_id, "text": f"✅ Pago OK. Únete a tu canal pulsando aquí y serás aprobado:\n👉 {link}"})
+            try: requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", json={"chat_id": user_id, "text": f"✅ *¡PAGO CONFIRMADO!*\n\nHas adquirido el plan *{plan.upper()}*.\n\nÚnete a tu canal VIP exclusivo pulsando el siguiente enlace y el sistema te aprobará automáticamente:\n👉 {link}\n\n¡Mucha suerte!", "parse_mode": "Markdown"})
             except: pass
 
     elif event['type'] == 'customer.subscription.deleted':
@@ -310,7 +383,7 @@ def webhook():
                 try: 
                     requests.post(f"https://api.telegram.org/bot{TOKEN}/banChatMember", json={"chat_id": chat_id, "user_id": t_id})
                     requests.post(f"https://api.telegram.org/bot{TOKEN}/unbanChatMember", json={"chat_id": chat_id, "user_id": t_id, "only_if_banned": True})
-                    requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", json={"chat_id": t_id, "text": "❌ *Suscripción Finalizada*\n\nTu acceso ha sido revocado. ¡Esperamos verte pronto!", "parse_mode": "Markdown"})
+                    requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", json={"chat_id": t_id, "text": "❌ *Suscripción Finalizada*\n\nTu suscripción ha terminado y el acceso al Canal VIP ha sido revocado. ¡Esperamos verte pronto!", "parse_mode": "Markdown"})
                 except Exception as e: print(f"Error expulsando usuario: {e}")
 
     return jsonify(success=True)
@@ -320,10 +393,19 @@ def run_flask():
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
-    print("🚀 Iniciando sistema completo ALPHABETS (Protegido)...")
+    print("🚀 Iniciando sistema completo ALPHABETS (Modo Dios Integrado)...")
     app = ApplicationBuilder().token(TOKEN).build()
+    
+    # Comandos
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("admin", admin_panel))
+    app.add_handler(CommandHandler("db", enviar_db))
+    app.add_handler(CommandHandler("mensaje", broadcast))
+    app.add_handler(CommandHandler("pagado", confirmar_pago))
+    
+    # Botones, Textos y Aduana
     app.add_handler(CallbackQueryHandler(manejar_botones))
     app.add_handler(ChatJoinRequestHandler(manejador_solicitudes))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, manejar_texto))
+    
     app.run_polling()
