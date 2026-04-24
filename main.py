@@ -1,11 +1,21 @@
 import os
 import threading
+import stripe
+import requests
 from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # === 1. CONFIGURACIÓN ===
-TOKEN = "8636942270:AAE-JyJVhfhTlbCiYixGaF3FLfTkbLWN-f8"
+TOKEN = os.environ.get("TOKEN", "TU_TOKEN_POR_SI_ACASO")
+stripe.api_key = os.environ.get("STRIPE_API_KEY")
+WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
+
+# 👇 IMPORTANTE: Pon aquí el número que te dio @userinfobot
+ADMIN_ID = 8000243455 
+
+# Archivo donde guardaremos a los clientes VIP
+VIP_FILE = "usuarios_vip.txt"
 
 LINKS_STRIPE = {
     "bronce": "https://buy.stripe.com/dRm7sM1aY3Un1ND2Cabo400",
@@ -26,7 +36,28 @@ TEXTO_BIENVENIDA = (
     "👇 *Selecciona una opción abajo para empezar:*"
 )
 
-# === 2. LÓGICA DEL BOT (START Y BOTONES) ===
+# === 2. GESTIÓN DE USUARIOS VIP ===
+def agregar_vip(user_id):
+    user_id = str(user_id)
+    if not os.path.exists(VIP_FILE):
+        open(VIP_FILE, "w").close()
+    
+    with open(VIP_FILE, "r") as f:
+        vips = f.read().splitlines()
+    
+    if user_id not in vips:
+        with open(VIP_FILE, "a") as f:
+            f.write(user_id + "\n")
+        return True
+    return False
+
+def obtener_vips():
+    if not os.path.exists(VIP_FILE):
+        return []
+    with open(VIP_FILE, "r") as f:
+        return f.read().splitlines()
+
+# === 3. LÓGICA DEL BOT ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     teclado = [
@@ -40,13 +71,33 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         await update.message.reply_text(TEXTO_BIENVENIDA, reply_markup=reply_markup, parse_mode="Markdown")
 
+async def enviar_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Solo el admin puede usar esto: /enviar_pick MENSAJE
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    mensaje = " ".join(context.args)
+    if not mensaje:
+        await update.message.reply_text("❌ Escribe algo: `/enviar_pick Gana Madrid...`", parse_mode="Markdown")
+        return
+
+    vips = obtener_vips()
+    enviados = 0
+    for uid in vips:
+        try:
+            await context.bot.send_message(chat_id=uid, text=f"🚀 *NUEVO PRONÓSTICO VIP*\n\n{mensaje}", parse_mode="Markdown")
+            enviados += 1
+        except: pass
+    
+    await update.message.reply_text(f"✅ Pick enviado a {enviados} usuarios VIP.")
+
 async def manejar_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
 
     if data == "menu_planes":
-        texto_planes = "🔥 *OFERTA POR TIEMPO LIMITADO*\n\n🥉 *BRONCE:* ~29,99€~ 👉 *19,99€*\n🥈 *PLATA:* ~59,99€~ 👉 *39,99€*\n🥇 *ORO:* ~89,99€~ 👉 *59,99€*\n💎 *DIAMANTE:* ~149,99€~ 👉 *99,99€*\n\n👇 *Toca un plan para activar:*"
+        texto_planes = "🔥 *OFERTA POR TIEMPO LIMITADO*\n\n🥉 *BRONCE:* ~29,99€~ 👉 *19,99€*\n🥈 *PLATA:* ~59,99€~ 👉 *39,99€*\n🥇 *ORO:* ~89,99€~ 👉 *59,99€*\n💎 *DIAMANTE:* ~149,99€~ 👉 *99,99€*\n\n👇 *Toca un plan para activar (Recibirás los picks por privado):*"
         botones = [
             [InlineKeyboardButton("🥉 Bronce", callback_data="plan_bronce"), InlineKeyboardButton("🥈 Plata", callback_data="plan_plata")],
             [InlineKeyboardButton("🥇 Oro", callback_data="plan_oro"), InlineKeyboardButton("💎 Diamante", callback_data="plan_diamante")],
@@ -72,37 +123,59 @@ async def manejar_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except: pass
 
     elif data == "menu_inicio":
-        botones = [[InlineKeyboardButton("💎 Ver Planes", callback_data="menu_planes")], [InlineKeyboardButton("🤝 Afiliados", callback_data="menu_afiliados")]]
+        botones = [[InlineKeyboardButton("💎 Ver Planes de Suscripción", callback_data="menu_planes")], [InlineKeyboardButton("🤝 Sistema de Afiliados", callback_data="menu_afiliados")]]
         try:
             with open("bienvenida.png", "rb") as f:
                 await query.edit_message_media(media=InputMediaPhoto(media=f, caption=TEXTO_BIENVENIDA, parse_mode="Markdown"), reply_markup=InlineKeyboardMarkup(botones))
         except: pass
 
-# === 3. SERVIDOR WEB PARA STRIPE (FLASK) ===
+# === 4. SERVIDOR WEB PARA RECIBIR PAGOS DE STRIPE ===
 app_flask = Flask(__name__)
 
 @app_flask.route('/')
 def home():
-    return "Bot funcionando correctamente"
+    return "Bot funcionando correctamente en Railway"
 
 @app_flask.route('/webhook', methods=['POST'])
 def webhook():
-    # Aquí es donde Stripe enviará la confirmación (lo configuraremos luego)
+    payload = request.data
+    sig_header = request.headers.get('Stripe-Signature')
+
+    try:
+        # Verificamos que el aviso venga de Stripe y no de un estafador
+        event = stripe.Webhook.construct_event(payload, sig_header, WEBHOOK_SECRET)
+    except Exception as e:
+        return jsonify(success=False), 400
+
+    # Si Stripe nos dice que el cliente ha pagado con éxito...
+    if event['type'] == 'checkout.session.completed':
+        session = event['data']['object']
+        
+        # Sacamos la ID del usuario que le enviamos oculto en el enlace
+        user_id = session.get('client_reference_id') 
+        
+        if user_id:
+            # Lo añadimos a la lista de VIPs y le avisamos por privado
+            agregar_vip(user_id)
+            texto_exito = "✅ *¡PAGO CONFIRMADO!*\n\nYa estás en la lista VIP. A partir de ahora recibirás todos nuestros pronósticos por este chat privado. ¡Mucha suerte!"
+            url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+            requests.post(url, json={"chat_id": user_id, "text": texto_exito, "parse_mode": "Markdown"})
+
     return jsonify(success=True)
 
 def run_flask():
-    # CAMBIO PARA RAILWAY: Usar el puerto que nos asigne el servidor
-    puerto = int(os.environ.get("PORT", 5000))
+    puerto = int(os.environ.get("PORT", 8080))
     app_flask.run(host='0.0.0.0', port=puerto)
 
-# === 4. ARRANQUE DEL BOT ===
+# === 5. ARRANQUE DEL BOT ===
 if __name__ == "__main__":
-    # Arrancamos el servidor web en un hilo aparte
+    # Encendemos el servidor de Stripe
     threading.Thread(target=run_flask, daemon=True).start()
     
-    # Arrancamos Telegram
+    # Encendemos el bot de Telegram
     print("🚀 Iniciando bot...")
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("enviar_pick", enviar_pick))
     app.add_handler(CallbackQueryHandler(manejar_botones))
     app.run_polling()
