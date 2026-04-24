@@ -11,7 +11,7 @@ TOKEN = os.environ.get("TOKEN", "TU_TOKEN_POR_SI_ACASO")
 stripe.api_key = os.environ.get("STRIPE_API_KEY")
 WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
 
-# 👇 IMPORTANTE: Pon aquí el número que te dio @userinfobot
+# Tu ID de administrador ya puesto
 ADMIN_ID = 8000243455 
 
 # Archivo donde guardaremos a los clientes VIP
@@ -91,6 +91,22 @@ async def enviar_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(f"✅ Pick enviado a {enviados} usuarios VIP.")
 
+async def ver_vips(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Solo tú (el admin) puedes ver la lista
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    vips = obtener_vips()
+    if not vips:
+        await update.message.reply_text("📭 Aún no tienes ningún usuario VIP.")
+        return
+
+    texto = f"👥 *Tienes {len(vips)} clientes VIP activos:*\n\n"
+    for uid in vips:
+        texto += f"• ID: `{uid}`\n"
+    
+    await update.message.reply_text(texto, parse_mode="Markdown")
+
 async def manejar_botones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -142,20 +158,16 @@ def webhook():
     sig_header = request.headers.get('Stripe-Signature')
 
     try:
-        # Verificamos que el aviso venga de Stripe y no de un estafador
         event = stripe.Webhook.construct_event(payload, sig_header, WEBHOOK_SECRET)
     except Exception as e:
         return jsonify(success=False), 400
 
-    # Si Stripe nos dice que el cliente ha pagado con éxito...
     if event['type'] == 'checkout.session.completed':
         session = event['data']['object']
         
-        # Sacamos la ID del usuario que le enviamos oculto en el enlace
         user_id = session.get('client_reference_id') 
         
         if user_id:
-            # Lo añadimos a la lista de VIPs y le avisamos por privado
             agregar_vip(user_id)
             texto_exito = "✅ *¡PAGO CONFIRMADO!*\n\nYa estás en la lista VIP. A partir de ahora recibirás todos nuestros pronósticos por este chat privado. ¡Mucha suerte!"
             url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -169,13 +181,12 @@ def run_flask():
 
 # === 5. ARRANQUE DEL BOT ===
 if __name__ == "__main__":
-    # Encendemos el servidor de Stripe
     threading.Thread(target=run_flask, daemon=True).start()
     
-    # Encendemos el bot de Telegram
     print("🚀 Iniciando bot...")
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("enviar_pick", enviar_pick))
+    app.add_handler(CommandHandler("ver_vips", ver_vips)) # <-- ¡AQUÍ ESTÁ EL COMANDO QUE FALTABA!
     app.add_handler(CallbackQueryHandler(manejar_botones))
     app.run_polling()
